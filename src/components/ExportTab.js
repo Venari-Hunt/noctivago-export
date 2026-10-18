@@ -107,8 +107,10 @@ export default class ExportPlugin {
             <option value="opus">Opus</option>
             <option value="flac">FLAC</option>
             <option value="ogg">Ogg Vorbis</option>
+            <option value="phone">For phone (Noctívago mobile)</option>
           </select>
         </label>
+        <p id="export-phone-hint" class="export-hint hidden">Saves a preset file for the Noctívago phone app instead of a fixed-length mix. Every sound's Remix settings and all reverb are baked in, so the phone only mixes. Length, fades and video don't apply.</p>
 
         <label class="export-check">
           <input id="export-faster" type="checkbox" />
@@ -271,6 +273,7 @@ export default class ExportPlugin {
       preset: container.querySelector('#export-preset'),
       length: container.querySelector('#export-length'),
       format: container.querySelector('#export-format'),
+      phoneHint: container.querySelector('#export-phone-hint'),
       faster: container.querySelector('#export-faster'),
       parallelMixdown: container.querySelector('#export-parallel-mixdown'),
       videoMode: container.querySelector('#export-video-mode'),
@@ -313,6 +316,9 @@ export default class ExportPlugin {
 
     this.unsubscribeProgress?.()
     this.unsubscribeProgress = this.api.export.onProgress((payload) => this.onExportProgress(payload))
+    this.els.format.addEventListener('change', () => {
+      this.els.phoneHint.classList.toggle('hidden', this.els.format.value !== 'phone')
+    })
 
     this.els.length.addEventListener('blur', () => this.normalizeLengthField())
     this.els.length.addEventListener('keydown', (evt) => {
@@ -574,6 +580,57 @@ export default class ExportPlugin {
     return { ...wholeMix }
   }
 
+  // "For phone" (app 0.1.268+): the app bakes each sound's clip, filters and
+  // reverb included, into a .ncvpreset the Noctívago phone app plays live.
+  async runPhoneExport(preset) {
+    if (!this.api.export.runPhone) {
+      this.els.status.textContent = 'Update Noctívago to export for phone.'
+      return
+    }
+    const outputPath = await this.api.export.pickDestination({ defaultName: preset.name, fileName: `${preset.name} - phone`, format: 'ncvpreset' })
+    if (!outputPath) return
+
+    this.exporting = true
+    this.els.run.disabled = true
+    this.els.status.className = 'export-status'
+    this.els.status.textContent = `Exporting "${preset.name}" for phone…`
+    this.els.log.innerHTML = ''
+    this.els.logWrap.classList.remove('hidden')
+    this.els.progressWrap.classList.remove('hidden')
+    this.els.progressBar.style.width = '0%'
+    this.els.progressPct.textContent = '0%'
+    const startedAt = Date.now()
+    this.lastStepAt = startedAt
+    this.startElapsedTicker(startedAt)
+    let result
+    try {
+      result = await this.api.export.runPhone({ presetId: preset.id, outputPath })
+    } catch (err) {
+      result = { ok: false, error: err.message }
+    }
+    this.closeLastLogLineTiming()
+    const elapsed = formatDuration((Date.now() - startedAt) / 1000)
+    this.els.progressWrap.classList.add('hidden')
+    if (result.ok) {
+      const mb = (result.totalBytes / (1024 * 1024)).toFixed(1)
+      const lines = [
+        `✓ Saved for phone to ${result.path} (${result.soundCount} sounds, ${mb} MB) — took ${elapsed}`,
+        'Send this file to your phone and open it with Noctívago.',
+        ...result.warnings.map((w) => `⚠ ${w}`)
+      ]
+      this.els.status.className = 'export-status export-status-success'
+      this.els.status.textContent = lines.join('\n')
+    } else {
+      this.els.status.className = 'export-status export-status-error'
+      this.els.status.textContent = `✗ Export failed after ${elapsed}: ${result.error}`
+    }
+    playCompletionChime(result.ok)
+    this.stopElapsedTicker()
+    this.els.elapsed.textContent = ''
+    this.exporting = false
+    this.els.run.disabled = false
+  }
+
   async runExport() {
     if (this.exporting) return
     const preset = this.presets.find((p) => p.id === this.els.preset.value)
@@ -581,6 +638,7 @@ export default class ExportPlugin {
       this.els.status.textContent = 'Choose a preset first.'
       return
     }
+    if (this.els.format.value === 'phone') return this.runPhoneExport(preset)
     const durationSeconds = parseDuration(this.els.length.value)
     if (!durationSeconds || durationSeconds <= 0) {
       this.els.status.textContent = 'Enter a valid length (hh:mm:ss).'

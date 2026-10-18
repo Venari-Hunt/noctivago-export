@@ -2,6 +2,8 @@
 
 An official plugin for [Noctívago](https://github.com/Venari-Hunt/Noctivago), the Windows ambient sound mixer. Bake a whole preset down to a single audio file of a chosen length and format.
 
+The "For phone" format instead saves a preset file for the Noctívago phone app, with every sound's settings and reverb baked in.
+
 ## Install
 
 In Noctívago, open **Settings > Community plugins > Browse**, pick **Export** and click **Install**. Official plugins install even with Restricted mode on.
