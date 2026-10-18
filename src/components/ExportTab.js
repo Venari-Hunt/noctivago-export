@@ -3,7 +3,9 @@ import { buildSceneSection, buildCreditsSection } from '../domain/sceneSummary.j
 import { parseDuration, formatDuration, formatDurationCompact } from '../domain/duration.js'
 import { applySoundOverride } from '../domain/soundOverride.js'
 import { videoKindFileLabel, DEFAULT_INFO_PROMPT, buildInfoFileText } from '../domain/infoFile.js'
+import { readPrefs, writePrefs, pickDefaultPresetId, DEFAULT_PREFS } from '../domain/exportPrefs.js'
 import { playCompletionChime } from './chime.js'
+import { requestActivePresetId } from './mixerStatus.js'
 
 // Bakes a whole preset down to one audio file of a chosen length/format -
 // its own tab (not just a Presets-modal button, per the owner's own explicit
@@ -88,13 +90,21 @@ export default class ExportPlugin {
   mount(container) {
     container.innerHTML = `
       <div class="export-tab">
-        <h2>Export a preset to one audio file</h2>
-        <p class="export-hint">Simulates how the preset's sounds would actually play over the chosen length (including Random Interval and Scheduled timing), then bakes the whole thing down to one file.</p>
+        <h2>Export a preset</h2>
+
+        <div class="export-kind" role="radiogroup" aria-label="Export type">
+          <button type="button" class="export-kind-option" role="radio" data-kind="file">Audio or video file</button>
+          <button type="button" class="export-kind-option" role="radio" data-kind="phone">For phone</button>
+        </div>
+        <p id="export-file-hint" class="export-hint">Simulates how the preset's sounds would actually play over the chosen length (including Random Interval and Scheduled timing), then bakes the whole thing down to one file.</p>
+        <p id="export-phone-hint" class="export-hint hidden">Saves a preset file for the Noctívago phone app. Every sound's Remix settings and all reverb are baked in, so the phone only mixes, and it plays for as long as you like.</p>
 
         <label>
           <span>Preset</span>
           <select id="export-preset"></select>
         </label>
+
+        <div id="export-file-options">
         <label>
           <span>Length</span>
           <input id="export-length" type="text" inputmode="numeric" placeholder="hh:mm:ss" value="1:00:00" />
@@ -107,10 +117,8 @@ export default class ExportPlugin {
             <option value="opus">Opus</option>
             <option value="flac">FLAC</option>
             <option value="ogg">Ogg Vorbis</option>
-            <option value="phone">For phone (Noctívago mobile)</option>
           </select>
         </label>
-        <p id="export-phone-hint" class="export-hint hidden">Saves a preset file for the Noctívago phone app instead of a fixed-length mix. Every sound's Remix settings and all reverb are baked in, so the phone only mixes. Length, fades and video don't apply.</p>
 
         <label class="export-check">
           <input id="export-faster" type="checkbox" />
@@ -251,6 +259,7 @@ export default class ExportPlugin {
           <input id="export-fade-out" type="number" min="0" max="60" step="0.5" value="2" />
           <span class="export-value">s</span>
         </label>
+        </div>
 
         <button id="export-run" class="btn btn-icon-text" type="button">Export</button>
         <span id="export-elapsed" class="export-elapsed"></span>
@@ -270,10 +279,13 @@ export default class ExportPlugin {
     `
 
     this.els = {
+      kindOptions: Array.from(container.querySelectorAll('.export-kind-option')),
+      fileHint: container.querySelector('#export-file-hint'),
+      phoneHint: container.querySelector('#export-phone-hint'),
+      fileOptions: container.querySelector('#export-file-options'),
       preset: container.querySelector('#export-preset'),
       length: container.querySelector('#export-length'),
       format: container.querySelector('#export-format'),
-      phoneHint: container.querySelector('#export-phone-hint'),
       faster: container.querySelector('#export-faster'),
       parallelMixdown: container.querySelector('#export-parallel-mixdown'),
       videoMode: container.querySelector('#export-video-mode'),
@@ -316,9 +328,23 @@ export default class ExportPlugin {
 
     this.unsubscribeProgress?.()
     this.unsubscribeProgress = this.api.export.onProgress((payload) => this.onExportProgress(payload))
-    this.els.format.addEventListener('change', () => {
-      this.els.phoneHint.classList.toggle('hidden', this.els.format.value !== 'phone')
-    })
+    // Kind, length, format and fades are remembered between exports (the
+    // other fields already persist through the app's settings store).
+    const prefs = readPrefs(localStorage)
+    this.els.length.value = prefs.length
+    this.els.format.value = prefs.format
+    this.els.fadeIn.value = String(prefs.fadeIn)
+    this.els.fadeOut.value = String(prefs.fadeOut)
+    this.setKind(prefs.kind)
+    for (const option of this.els.kindOptions) {
+      option.addEventListener('click', () => {
+        this.setKind(option.dataset.kind)
+        this.savePrefs()
+      })
+    }
+    for (const field of [this.els.format, this.els.fadeIn, this.els.fadeOut]) {
+      field.addEventListener('change', () => this.savePrefs())
+    }
 
     this.els.length.addEventListener('blur', () => this.normalizeLengthField())
     this.els.length.addEventListener('keydown', (evt) => {
@@ -442,11 +468,30 @@ export default class ExportPlugin {
 
   normalizeLengthField() {
     const seconds = parseDuration(this.els.length.value)
-    if (seconds === null || seconds <= 0) {
-      this.els.length.value = '1:00:00'
-      return
-    }
-    this.els.length.value = formatDuration(seconds)
+    this.els.length.value = seconds === null || seconds <= 0 ? DEFAULT_PREFS.length : formatDuration(seconds)
+    this.savePrefs()
+  }
+
+  // The export kind is picked first: "For phone" hides everything that only
+  // means something for a fixed-length file (length, format, fades, video,
+  // info file, speed options).
+  setKind(kind) {
+    this.kind = kind
+    const isPhone = kind === 'phone'
+    for (const option of this.els.kindOptions) option.setAttribute('aria-checked', String(option.dataset.kind === kind))
+    this.els.fileOptions.classList.toggle('hidden', isPhone)
+    this.els.fileHint.classList.toggle('hidden', isPhone)
+    this.els.phoneHint.classList.toggle('hidden', !isPhone)
+  }
+
+  savePrefs() {
+    writePrefs(localStorage, {
+      kind: this.kind,
+      length: this.els.length.value,
+      format: this.els.format.value,
+      fadeIn: Number(this.els.fadeIn.value),
+      fadeOut: Number(this.els.fadeOut.value)
+    })
   }
 
   // Renderer has no Node `path` module (sandboxed, per this app's plugin
@@ -555,7 +600,8 @@ export default class ExportPlugin {
     this.library = library
     const previouslySelected = this.els.preset.value
     this.els.preset.innerHTML = presets.map((p) => `<option value="${p.id}">${p.name}</option>`).join('')
-    if (presets.some((p) => p.id === previouslySelected)) this.els.preset.value = previouslySelected
+    // Each visit to the tab starts on the preset loaded in the Mixer.
+    this.els.preset.value = pickDefaultPresetId(presets, requestActivePresetId(), previouslySelected)
   }
 
   // No Export-tab UI of its own for these (see the mount() comment above) -
@@ -638,7 +684,7 @@ export default class ExportPlugin {
       this.els.status.textContent = 'Choose a preset first.'
       return
     }
-    if (this.els.format.value === 'phone') return this.runPhoneExport(preset)
+    if (this.kind === 'phone') return this.runPhoneExport(preset)
     const durationSeconds = parseDuration(this.els.length.value)
     if (!durationSeconds || durationSeconds <= 0) {
       this.els.status.textContent = 'Enter a valid length (hh:mm:ss).'

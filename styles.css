@@ -8,6 +8,38 @@
   font-size: 15px;
 }
 
+.export-kind {
+  display: inline-flex;
+  margin: 4px 0 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+
+.export-kind-option {
+  height: var(--control-h);
+  padding: 0 14px;
+  border: 0;
+  background: var(--surface);
+  color: var(--text-dim);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.export-kind-option + .export-kind-option {
+  border-left: 1px solid var(--border);
+}
+
+.export-kind-option:hover {
+  background: var(--surface-hover);
+}
+
+.export-kind-option[aria-checked='true'] {
+  background: var(--accent);
+  color: var(--on-accent);
+}
+
 .export-hint {
   margin: 0 0 16px;
   font-size: 12px;
