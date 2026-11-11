@@ -4,8 +4,10 @@ import { parseDuration, formatDuration, formatDurationCompact } from '../domain/
 import { applySoundOverride } from '../domain/soundOverride.js'
 import { videoKindFileLabel, DEFAULT_INFO_PROMPT, buildInfoFileText } from '../domain/infoFile.js'
 import { readPrefs, writePrefs, pickDefaultPresetId, DEFAULT_PREFS } from '../domain/exportPrefs.js'
+import { describeFile, estimateBytes, formatBytes } from '../domain/exportSummary.js'
 import { playCompletionChime } from './chime.js'
 import { requestActivePresetId } from './mixerStatus.js'
+import { icon } from './icons.js'
 
 // Bakes a whole preset down to one audio file of a chosen length/format -
 // its own tab (not just a Presets-modal button, per the owner's own explicit
@@ -16,6 +18,23 @@ import { requestActivePresetId } from './mixerStatus.js'
 // already uses, run as a dry loop - see simulate.js), then hand the
 // resulting event lists to a main-process ffmpeg pipeline that builds one
 // track per included sound and mixes them down.
+//
+// Desktop 2.0 (step 16): the screen follows the approved mock's `export`,
+// `export-video`, `export-phone`, `export-run` and `export-done` screens. A
+// form column (type, preset, length, fade, output, format tiles, video card,
+// options) beside a summary card that turns into the progress ring while an
+// export runs and into the result when it ends.
+
+const FORMATS = [['wav', 'WAV', 'Lossless'], ['flac', 'FLAC', 'Lossless, smaller'], ['mp3', 'MP3', 'Plays anywhere'], ['opus', 'Opus', 'Small'], ['ogg', 'Ogg Vorbis', 'Small, open']]
+const OUTPUTS = [['audio-only', 'Audio only'], ['video-only', 'Video only'], ['both', 'Both']]
+const VIDEO_KINDS = [['black', 'moon', 'Flat black screen', 'Fastest, near-instant'], ['file', 'file', 'Loop a video file', 'Choose video…'], ['image', 'eye', 'Loop an image', 'Choose image…'], ['visualization', 'audio-waveform', 'Visualization', 'Reacts to the audio']]
+
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c])
+const baseName = (p) => (p ? String(p).split(/[\\/]/).pop() : '')
+const sw = (id, label) => `<button id="${id}" class="ex-sw" type="button" role="switch" aria-checked="false" aria-label="${label}"></button>`
+const row = (title, sub, trail, attrs = '') => `<div class="ex-row" ${attrs}><div class="ex-sl"><span>${title}</span>${sub ? `<small>${sub}</small>` : ''}</div><div class="ex-trail">${trail}</div></div>`
+const ring = (kids) => `<div class="ex-ring"><svg viewBox="0 0 72 72" aria-hidden="true"><circle class="ex-trk" cx="36" cy="36" r="31" pathLength="100"/><circle class="ex-val" cx="36" cy="36" r="31" pathLength="100"/></svg>${kids}</div>`
+
 export default class ExportPlugin {
   constructor(app) {
     this.app = app
@@ -24,7 +43,11 @@ export default class ExportPlugin {
     this.library = []
     this.els = {}
     this.exporting = false
-    this.logCollapsed = false
+    this.view = 'form'
+    this.steps = []
+    this.logLines = []
+    this.logOpen = false
+    this.result = null
   }
 
   async onload() {
@@ -42,288 +65,150 @@ export default class ExportPlugin {
     this.unregister?.()
   }
 
-  // Stamps how long the just-finished log line's phase actually took, right
-  // onto that line - see onExportProgress's own comment for why.
+  // Stamps how long the just-finished step actually took onto its log line
+  // and its row in the steps list - see onExportProgress's own comment.
   closeLastLogLineTiming() {
     if (this.lastStepAt == null) return
-    const elapsed = formatDuration((Date.now() - this.lastStepAt) / 1000)
-    const prevLine = this.els.log?.lastElementChild
-    if (prevLine) prevLine.textContent += ` (${elapsed})`
+    const seconds = (Date.now() - this.lastStepAt) / 1000
+    const last = this.steps[this.steps.length - 1]
+    if (last && last.took == null) {
+      last.took = seconds
+      this.logLines[last.logIndex] += ` (${formatDuration(seconds)})`
+    }
     this.lastStepAt = null
   }
 
   onExportProgress(payload) {
-    if (!this.exporting || !this.els.progressBar) return
-    const pct = Math.round((payload.fraction ?? 0) * 100)
-    this.els.progressBar.style.width = `${pct}%`
-    this.els.progressPct.textContent = `${pct}%`
+    if (!this.exporting) return
     // Feeds the elapsed/ETA ticker below - the only other thing ffmpeg's
-    // progress stream gives us is the same 0..1 fraction the bar already
+    // progress stream gives us is the same 0..1 fraction the ring already
     // shows, so an ETA is just elapsed * (remaining/done), no new plumbing.
     this.lastFraction = payload.fraction ?? this.lastFraction
     if (payload.type === 'step' && payload.label) {
-      this.els.status.textContent = payload.label
       // Per-phase wall-clock timing (2026-09-02, Export Part B investigation):
-      // synthetic benchmarking of the parallelMixdown toggle showed no real
-      // speedup on test content, casting doubt on the earlier circumstantial
-      // reasoning that the final mixdown is the actual bottleneck on a real
-      // multi-hour export. Rather than guess further, surface how long each
-      // phase actually took, right in the log every export already writes -
-      // the next real slow export will show definitively where the time
-      // goes, instead of relying on speculation.
+      // surface how long each phase actually took, right in the log every
+      // export already writes - the next real slow export shows where the
+      // time goes. Each line also carries the real time it started
+      // ("the logging on the export tab should be timestamped with real
+      // time and the time it took to complete that step").
       this.closeLastLogLineTiming()
       this.lastStepAt = Date.now()
-      const line = document.createElement('div')
-      line.className = 'export-log-line'
-      // Real wall-clock timestamp alongside the existing step-duration stamp
-      // (which only appears once the step is *over*) - reported directly
-      // ("the logging on the export tab should be timestamped with real
-      // time and the time it took to complete that step") so a step that's
-      // still running shows *when* it started, not just silence until it
-      // eventually finishes.
-      line.textContent = `[${new Date().toLocaleTimeString()}] ${payload.label}`
-      this.els.log.appendChild(line)
-      this.els.log.scrollTop = this.els.log.scrollHeight
+      this.logLines.push(`[${new Date().toLocaleTimeString()}] ${payload.label}`)
+      this.steps.push({ label: payload.label, took: null, logIndex: this.logLines.length - 1 })
+      this.renderSteps()
+      this.renderLog()
     }
+    this.renderProgress()
   }
 
   mount(container) {
+    const tiles5 = FORMATS.map(([v, t, d]) => `<button type="button" data-format="${v}" aria-pressed="false"><b>${t}</b><span>${d}</span></button>`).join('')
+    const tiles4 = VIDEO_KINDS.map(([v, ic, t, d]) => `<button type="button" data-vid="${v}" aria-pressed="false">${icon(ic, 20)}<b>${t}</b><span>${d}</span></button>`).join('')
+    const outs = OUTPUTS.map(([v, t]) => `<button type="button" data-out="${v}" aria-pressed="false">${t}</button>`).join('')
+    const select = (id, label, opts) => `<select id="${id}" class="ex-field ex-w224" aria-label="${label}">${opts.map(([v, t]) => `<option value="${v}">${t}</option>`).join('')}</select>`
     container.innerHTML = `
       <div class="export-tab">
-        <h2>Export a preset</h2>
-
-        <div class="export-kind" role="radiogroup" aria-label="Export type">
-          <button type="button" class="export-kind-option" role="radio" data-kind="file">Audio or video file</button>
-          <button type="button" class="export-kind-option" role="radio" data-kind="phone">For phone</button>
-        </div>
-        <p id="export-file-hint" class="export-hint">Simulates how the preset's sounds would actually play over the chosen length (including Random Interval and Scheduled timing), then bakes the whole thing down to one file.</p>
-        <p id="export-phone-hint" class="export-hint hidden">Saves a preset file for the Noctívago phone app. Every sound's Remix settings and all reverb are baked in, so the phone only mixes, and it plays for as long as you like.</p>
-
-        <label>
-          <span>Preset</span>
-          <select id="export-preset"></select>
-        </label>
-
-        <div id="export-file-options">
-        <label>
-          <span>Length</span>
-          <input id="export-length" type="text" inputmode="numeric" placeholder="hh:mm:ss" value="1:00:00" />
-        </label>
-        <label>
-          <span>Format</span>
-          <select id="export-format">
-            <option value="wav">WAV (lossless)</option>
-            <option value="mp3">MP3</option>
-            <option value="opus">Opus</option>
-            <option value="flac">FLAC</option>
-            <option value="ogg">Ogg Vorbis</option>
-          </select>
-        </label>
-
-        <label class="export-check">
-          <input id="export-faster" type="checkbox" />
-          <span>Faster export — uses more CPU and memory. Renders several parts of the export at once; noticeably quicker on long presets with lots of Random Interval or Scheduled sounds. Leave off if you want to keep working on the PC while it runs.</span>
-        </label>
-
-        <label class="export-check">
-          <input id="export-parallel-mixdown" type="checkbox" />
-          <span>Parallel mixdown (experimental) — uses more CPU, memory, and disk space. Renders every Loop-mode sound's own track at once instead of one after another, on a long export with several of them playing the whole time. Test-scale benchmarks didn't show a clear speedup, so try it on your real slow export and see — the log below now shows how long each step actually took either way. Independent of "Faster export" above — turn on either, both, or neither.</span>
-        </label>
-
-        <label>
-          <span>Output</span>
-          <select id="export-video-mode">
-            <option value="audio-only">Audio only</option>
-            <option value="video-only">Video only (for YouTube)</option>
-            <option value="both">Both audio and video</option>
-          </select>
-        </label>
-        <p class="export-hint">"Video" writes a .mkv next to (or instead of) the audio file — YouTube needs a video track, this adds one without a separate step. Choose what plays below.</p>
-
-        <div id="export-video-background-row" class="export-loop-video-row hidden">
-          <label>
-            <span>Video</span>
-            <select id="export-video-background">
-              <option value="black">Flat black screen (fastest, near-instant)</option>
-              <option value="file">Loop a video file</option>
-              <option value="image">Loop an image</option>
-              <option value="visualization">Audio-reactive visualization</option>
-            </select>
-          </label>
-
-          <div id="export-video-file-section" class="export-video-subsection hidden">
-            <div class="export-loop-video-buttons">
-              <button id="export-choose-video" class="btn" type="button">Choose video to loop…</button>
-              <button id="export-clear-video" class="btn" type="button">Clear</button>
+        <div class="ex-cols">
+          <div class="ex-col">
+            <div class="ex-card">
+              <div class="ex-head">
+                <div class="ex-seg" role="group" aria-label="Export type">
+                  <button type="button" data-kind="file" aria-pressed="false">Audio or video</button>
+                  <button type="button" data-kind="phone" aria-pressed="false">For phone</button>
+                </div>
+              </div>
+              <p id="export-phone-hint" class="ex-prose" hidden>Saves a preset file for the Noctívago phone app. Every sound's Remix settings and all reverb are baked in, so the phone only mixes, and it plays for as long as you like.</p>
+              ${row('Preset', '', '<select id="export-preset" class="ex-field ex-w224" aria-label="Preset"></select>')}
+              <div id="export-file-options">
+                ${row('Length', 'Plays the mix for real over this time, random sounds included', '<input id="export-length" class="ex-field ex-w96 ex-tc" type="text" inputmode="numeric" placeholder="hh:mm:ss" value="1:00:00" aria-label="Length" />')}
+                ${row('Fade', 'In and out, seconds', '<input id="export-fade-in" class="ex-field ex-w64 ex-tc" type="number" min="0" max="60" step="0.5" value="2" aria-label="Fade in" /><input id="export-fade-out" class="ex-field ex-w64 ex-tc" type="number" min="0" max="60" step="0.5" value="2" aria-label="Fade out" />')}
+                ${row('Output', 'Video only is for YouTube', `<div class="ex-seg ex-seg-in" role="group" aria-label="Output">${outs}</div>`)}
+                <div id="export-formats" class="ex-tiles5" role="group" aria-label="Format">${tiles5}</div>
+              </div>
             </div>
-            <p id="export-video-path" class="export-hint export-video-path"></p>
-            <p class="export-hint">If it's shorter than the export it repeats from the start with a hard cut at the seam (no crossfade), so a video that already loops cleanly on its own works best.</p>
-          </div>
 
-          <div id="export-image-section" class="export-video-subsection hidden">
-            <div class="export-loop-video-buttons">
-              <button id="export-choose-image" class="btn" type="button">Choose image…</button>
-              <button id="export-clear-image" class="btn" type="button">Clear</button>
+            <div id="export-video-card" class="ex-card" hidden>
+              <h2 class="ex-gh">Video</h2>
+              <div class="ex-tiles4" role="group" aria-label="Video">${tiles4}</div>
+              <div id="export-video-file-section" hidden>
+                ${row('Video to loop', '<span id="export-video-path">Nothing chosen yet</span>', '<button id="export-choose-video" class="ex-b" type="button">Choose video…</button><button id="export-clear-video" class="ex-b ex-ghost" type="button">Clear</button>')}
+                <p class="ex-hint">Shorter than the export? It repeats from the start with a hard cut, so a video that already loops cleanly works best.</p>
+              </div>
+              <div id="export-image-section" hidden>
+                ${row('Image', '<span id="export-image-path">Nothing chosen yet</span>', '<button id="export-choose-image" class="ex-b" type="button">Choose image…</button><button id="export-clear-image" class="ex-b ex-ghost" type="button">Clear</button>')}
+                ${row('Motion', 'Fades in and out with the audio', select('export-image-motion', 'Motion', [['none', 'None (static)'], ['spin', 'Spin'], ['bounce', 'DVD bounce']]))}
+              </div>
+              <div id="export-viz-section" hidden>
+                ${row('Style', '', select('export-viz-type', 'Style', [['waveform', 'Waveform'], ['spectrum', 'Spectrum'], ['vectorscope', 'Vectorscope']]))}
+                <div id="export-viz-palette-row" hidden>${row('Palette', '', select('export-viz-palette', 'Palette', [['intensity', 'Intensity'], ['rainbow', 'Rainbow'], ['fire', 'Fire'], ['magma', 'Magma'], ['cool', 'Cool'], ['moreland', 'Moreland']]))}</div>
+                <div id="export-viz-color-row">${row('Color', '', '<input id="export-viz-color" type="color" class="ex-colorpick" value="#9ece6a" aria-label="Color" />')}</div>
+                ${row('Background', 'Black renders fastest', '<input id="export-viz-bg-color" type="color" class="ex-colorpick" value="#000000" aria-label="Background" />')}
+                ${row('Size', '', select('export-viz-size', 'Size', [['small', 'Small (854×480)'], ['medium', 'Medium (1280×720)'], ['large', 'Large (1920×1080)']]))}
+                ${row('Frame rate', 'Higher is smoother and slower', select('export-viz-fps', 'Frame rate', [['15', '15 fps (fastest)'], ['30', '30 fps'], ['60', '60 fps (smoothest)']]))}
+              </div>
             </div>
-            <p id="export-image-path" class="export-hint export-video-path"></p>
-            <label>
-              <span>Motion</span>
-              <select id="export-image-motion">
-                <option value="none">None (static)</option>
-                <option value="spin">Spin</option>
-                <option value="bounce">DVD bounce</option>
-              </select>
-            </label>
-            <p class="export-hint">Uses the Fade in/out seconds below to fade the image in and out too, instead of a separate setting.</p>
+
+            <div id="export-options-card" class="ex-card">
+              <h2 class="ex-gh">Options</h2>
+              ${row('Faster export', 'Uses more CPU and memory. Turn off to keep working while it runs.', sw('export-faster', 'Faster export'))}
+              ${row('Info file', 'Name, length and sounds, ready for a video description', sw('export-info-file', 'Info file'))}
+              <div id="export-info-prompt-wrap" hidden>
+                ${row('Info file prompt', '<span id="export-info-prompt-state">Default</span>', icon('chevron-right'), 'id="export-info-prompt-toggle" class="ex-row ex-click" role="button" tabindex="0" aria-expanded="false"')}
+                <div id="export-info-prompt-row" hidden>
+                  <textarea id="export-info-prompt" class="ex-field ex-ta" rows="6" aria-label="Info file prompt"></textarea>
+                  <p class="ex-hint">The AI prompt at the end of the info file. Leave it empty for the default (shown faded).</p>
+                </div>
+              </div>
+              ${row('Parallel mixdown', 'Experimental. More CPU, memory and disk.', sw('export-parallel-mixdown', 'Parallel mixdown'))}
+            </div>
           </div>
-
-          <div id="export-viz-section" class="export-video-subsection hidden">
-            <label>
-              <span>Style</span>
-              <select id="export-viz-type">
-                <option value="waveform">Waveform</option>
-                <option value="spectrum">Spectrum</option>
-                <option value="vectorscope">Vectorscope</option>
-              </select>
-            </label>
-            <label id="export-viz-color-row">
-              <span>Color</span>
-              <input id="export-viz-color" type="color" value="#9ece6a" />
-            </label>
-            <label id="export-viz-palette-row" class="hidden">
-              <span>Palette</span>
-              <select id="export-viz-palette">
-                <option value="intensity">Intensity</option>
-                <option value="rainbow">Rainbow</option>
-                <option value="fire">Fire</option>
-                <option value="magma">Magma</option>
-                <option value="cool">Cool</option>
-                <option value="moreland">Moreland</option>
-              </select>
-            </label>
-            <label>
-              <span>Background</span>
-              <input id="export-viz-bg-color" type="color" value="#000000" />
-            </label>
-            <label>
-              <span>Size</span>
-              <select id="export-viz-size">
-                <option value="small">Small (854×480)</option>
-                <option value="medium">Medium (1280×720)</option>
-                <option value="large">Large (1920×1080)</option>
-              </select>
-            </label>
-            <label>
-              <span>Frame rate</span>
-              <select id="export-viz-fps">
-                <option value="15">15 fps (fastest)</option>
-                <option value="30">30 fps</option>
-                <option value="60">60 fps (smoothest, slowest)</option>
-              </select>
-            </label>
-            <p class="export-hint">Draws a moving waveform/spectrum/vectorscope from the actual exported audio. Stays fastest on a plain black background — a custom background color renders noticeably slower (it has to blend two images per frame instead of one). Higher frame rates look smoother but take proportionally longer to render.</p>
-          </div>
-        </div>
-
-        <label class="export-check">
-          <input id="export-info-file" type="checkbox" />
-          <span>Also write an info file (preset name, length, format, sounds + tags) next to the export — raw material for writing a YouTube/social description by hand or with an AI's help.</span>
-        </label>
-        <div id="export-info-prompt-row" class="export-info-prompt-row" hidden>
-          <p class="export-hint">AI prompt at the end of the info file. Leave empty to use the default (shown faded).</p>
-          <textarea id="export-info-prompt" rows="6"></textarea>
-        </div>
-
-        <!-- Highpass/Lowpass/Gain used to live here too ("whole-mix
-             processing"), but the owner asked directly for them to be
-             removed and for whole-mix processing to live only on the
-             Preset Remix tab (v0.1.125): "Get rid of the whole mix
-             processing section on the export tab... the whole mix thing
-             should be kept on the preset remix tab." That left exports with
-             no whole-mix coloring at all even when the exported preset had
-             real Preset Remix settings - flagged to the owner as a
-             trade-off worth a follow-up call. Answered directly (2026-09-02):
-             "Yeah it should [inherit them]. Should be the last thing applied
-             tho." So there's still no UI here - currentWholeMixFilters()
-             instead reads the selected preset's own saved wholeMix
-             (highpass/lowpass/gain/EQ) straight from presets.list() and
-             exportMix.js applies it last, over the whole mixed-down export,
-             matching WholeMixChain.js's own live node order. -->
-        <label>
-          <span>Fade in</span>
-          <input id="export-fade-in" type="number" min="0" max="60" step="0.5" value="2" />
-          <span class="export-value">s</span>
-        </label>
-        <label>
-          <span>Fade out</span>
-          <input id="export-fade-out" type="number" min="0" max="60" step="0.5" value="2" />
-          <span class="export-value">s</span>
-        </label>
-        </div>
-
-        <button id="export-run" class="btn btn-icon-text" type="button">Export</button>
-        <span id="export-elapsed" class="export-elapsed"></span>
-        <p id="export-status" class="export-status"></p>
-        <div id="export-progress-wrap" class="export-progress-wrap hidden">
-          <div class="export-progress-track"><div id="export-progress-bar" class="export-progress-bar"></div></div>
-          <span id="export-progress-pct" class="export-progress-pct">0%</span>
-        </div>
-        <div id="export-log-wrap" class="export-log-wrap hidden">
-          <div class="export-log-header">
-            <button id="export-log-toggle" class="export-log-toggle" type="button" aria-expanded="true">▾ Log</button>
-            <button id="export-log-copy" class="btn export-log-copy" type="button">Copy log</button>
-          </div>
-          <div id="export-log" class="export-log"></div>
+          <div id="export-sum" class="ex-card ex-sum" aria-live="polite"></div>
         </div>
       </div>
     `
 
+    const q = (s) => container.querySelector(s)
     this.els = {
-      kindOptions: Array.from(container.querySelectorAll('.export-kind-option')),
-      fileHint: container.querySelector('#export-file-hint'),
-      phoneHint: container.querySelector('#export-phone-hint'),
-      fileOptions: container.querySelector('#export-file-options'),
-      preset: container.querySelector('#export-preset'),
-      length: container.querySelector('#export-length'),
-      format: container.querySelector('#export-format'),
-      faster: container.querySelector('#export-faster'),
-      parallelMixdown: container.querySelector('#export-parallel-mixdown'),
-      videoMode: container.querySelector('#export-video-mode'),
-      videoBackgroundRow: container.querySelector('#export-video-background-row'),
-      videoBackground: container.querySelector('#export-video-background'),
-      videoFileSection: container.querySelector('#export-video-file-section'),
-      chooseVideo: container.querySelector('#export-choose-video'),
-      clearVideo: container.querySelector('#export-clear-video'),
-      videoPath: container.querySelector('#export-video-path'),
-      imageSection: container.querySelector('#export-image-section'),
-      chooseImage: container.querySelector('#export-choose-image'),
-      clearImage: container.querySelector('#export-clear-image'),
-      imagePath: container.querySelector('#export-image-path'),
-      imageMotion: container.querySelector('#export-image-motion'),
-      vizSection: container.querySelector('#export-viz-section'),
-      vizType: container.querySelector('#export-viz-type'),
-      vizColorRow: container.querySelector('#export-viz-color-row'),
-      vizColor: container.querySelector('#export-viz-color'),
-      vizPaletteRow: container.querySelector('#export-viz-palette-row'),
-      vizPalette: container.querySelector('#export-viz-palette'),
-      vizBgColor: container.querySelector('#export-viz-bg-color'),
-      vizSize: container.querySelector('#export-viz-size'),
-      vizFps: container.querySelector('#export-viz-fps'),
-      infoFile: container.querySelector('#export-info-file'),
-      infoPromptRow: container.querySelector('#export-info-prompt-row'),
-      infoPrompt: container.querySelector('#export-info-prompt'),
-      fadeIn: container.querySelector('#export-fade-in'),
-      fadeOut: container.querySelector('#export-fade-out'),
-      run: container.querySelector('#export-run'),
-      elapsed: container.querySelector('#export-elapsed'),
-      status: container.querySelector('#export-status'),
-      progressWrap: container.querySelector('#export-progress-wrap'),
-      progressBar: container.querySelector('#export-progress-bar'),
-      progressPct: container.querySelector('#export-progress-pct'),
-      logWrap: container.querySelector('#export-log-wrap'),
-      logToggle: container.querySelector('#export-log-toggle'),
-      logCopy: container.querySelector('#export-log-copy'),
-      log: container.querySelector('#export-log')
+      kindOptions: Array.from(container.querySelectorAll('[data-kind]')),
+      outOptions: Array.from(container.querySelectorAll('[data-out]')),
+      formatOptions: Array.from(container.querySelectorAll('[data-format]')),
+      vidOptions: Array.from(container.querySelectorAll('[data-vid]')),
+      phoneHint: q('#export-phone-hint'),
+      fileOptions: q('#export-file-options'),
+      formats: q('#export-formats'),
+      preset: q('#export-preset'),
+      length: q('#export-length'),
+      faster: q('#export-faster'),
+      parallelMixdown: q('#export-parallel-mixdown'),
+      videoCard: q('#export-video-card'),
+      optionsCard: q('#export-options-card'),
+      videoFileSection: q('#export-video-file-section'),
+      chooseVideo: q('#export-choose-video'),
+      clearVideo: q('#export-clear-video'),
+      videoPath: q('#export-video-path'),
+      imageSection: q('#export-image-section'),
+      chooseImage: q('#export-choose-image'),
+      clearImage: q('#export-clear-image'),
+      imagePath: q('#export-image-path'),
+      imageMotion: q('#export-image-motion'),
+      vizSection: q('#export-viz-section'),
+      vizType: q('#export-viz-type'),
+      vizColorRow: q('#export-viz-color-row'),
+      vizColor: q('#export-viz-color'),
+      vizPaletteRow: q('#export-viz-palette-row'),
+      vizPalette: q('#export-viz-palette'),
+      vizBgColor: q('#export-viz-bg-color'),
+      vizSize: q('#export-viz-size'),
+      vizFps: q('#export-viz-fps'),
+      infoFile: q('#export-info-file'),
+      infoPromptWrap: q('#export-info-prompt-wrap'),
+      infoPromptToggle: q('#export-info-prompt-toggle'),
+      infoPromptState: q('#export-info-prompt-state'),
+      infoPromptRow: q('#export-info-prompt-row'),
+      infoPrompt: q('#export-info-prompt'),
+      fadeIn: q('#export-fade-in'),
+      fadeOut: q('#export-fade-out'),
+      sum: q('#export-sum')
     }
 
     this.unsubscribeProgress?.()
@@ -332,63 +217,80 @@ export default class ExportPlugin {
     // other fields already persist through the app's settings store).
     const prefs = readPrefs(localStorage)
     this.els.length.value = prefs.length
-    this.els.format.value = prefs.format
+    this.format = prefs.format
     this.els.fadeIn.value = String(prefs.fadeIn)
     this.els.fadeOut.value = String(prefs.fadeOut)
+    this.videoMode = 'audio-only'
+    this.videoBackground = 'black'
     this.setKind(prefs.kind)
+    this.setFormat(prefs.format)
+    this.setVideoMode('audio-only')
+    this.setVideoBackground('black')
+
     for (const option of this.els.kindOptions) {
       option.addEventListener('click', () => {
         this.setKind(option.dataset.kind)
         this.savePrefs()
       })
     }
-    for (const field of [this.els.format, this.els.fadeIn, this.els.fadeOut]) {
+    for (const option of this.els.formatOptions) {
+      option.addEventListener('click', () => {
+        this.setFormat(option.dataset.format)
+        this.savePrefs()
+      })
+    }
+    for (const option of this.els.outOptions) {
+      option.addEventListener('click', () => {
+        this.setVideoMode(option.dataset.out)
+        this.api.settings.setExportVideoMode(option.dataset.out)
+      })
+    }
+    for (const option of this.els.vidOptions) {
+      option.addEventListener('click', () => {
+        this.setVideoBackground(option.dataset.vid)
+        this.api.settings.setExportVideoBackground(option.dataset.vid)
+      })
+    }
+    for (const field of [this.els.fadeIn, this.els.fadeOut]) {
       field.addEventListener('change', () => this.savePrefs())
     }
-
+    this.els.preset.addEventListener('change', () => this.renderSummary())
     this.els.length.addEventListener('blur', () => this.normalizeLengthField())
     this.els.length.addEventListener('keydown', (evt) => {
       if (evt.key === 'Enter') this.els.length.blur()
     })
-    this.els.run.addEventListener('click', () => this.runExport())
-    // Collapse/expand only hides the scrolling line list - the header (with
-    // Copy log) stays visible so you can still grab the log without
-    // re-expanding it first. State is per-session only, not persisted; a new
-    // export leaves it as you last set it rather than forcing it back open.
-    this.els.logToggle.addEventListener('click', () => this.toggleLogCollapsed())
-    this.els.logCopy.addEventListener('click', () => this.copyLogToClipboard())
 
     // "Faster export" is a per-machine resource choice made right before an
     // export, so it lives here rather than in the global Settings modal - but
     // it's still persisted (via the same settings store the export:run handler
     // reads) so the last choice sticks between sessions.
-    this.els.faster.addEventListener('change', () => {
-      this.api.settings.setFasterExportEnabled(this.els.faster.checked)
-    })
-    this.els.parallelMixdown.addEventListener('change', () => {
-      this.api.settings.setParallelMixdownEnabled(this.els.parallelMixdown.checked)
-    })
-    this.els.videoMode.addEventListener('change', () => {
-      this.api.settings.setExportVideoMode(this.els.videoMode.value)
-      this.updateVideoBackgroundRowVisibility()
-    })
-    this.els.infoFile.addEventListener('change', () => {
-      this.api.settings.setExportInfoFileEnabled(this.els.infoFile.checked)
-      this.els.infoPromptRow.hidden = !this.els.infoFile.checked
+    this.bindSwitch(this.els.faster, (on) => this.api.settings.setFasterExportEnabled(on))
+    this.bindSwitch(this.els.parallelMixdown, (on) => this.api.settings.setParallelMixdownEnabled(on))
+    this.bindSwitch(this.els.infoFile, (on) => {
+      this.api.settings.setExportInfoFileEnabled(on)
+      this.els.infoPromptWrap.hidden = !on
     })
     this.els.infoPrompt.placeholder = DEFAULT_INFO_PROMPT
     this.els.infoPrompt.addEventListener('change', () => {
       this.api.settings.setExportInfoPrompt(this.els.infoPrompt.value)
+      this.updateInfoPromptState()
     })
-    this.els.videoBackground.addEventListener('change', () => {
-      this.api.settings.setExportVideoBackground(this.els.videoBackground.value)
-      this.updateVideoBackgroundSubsectionVisibility()
+    const togglePrompt = () => {
+      const open = this.els.infoPromptRow.hidden
+      this.els.infoPromptRow.hidden = !open
+      this.els.infoPromptToggle.setAttribute('aria-expanded', String(open))
+    }
+    this.els.infoPromptToggle.addEventListener('click', togglePrompt)
+    this.els.infoPromptToggle.addEventListener('keydown', (evt) => {
+      if (evt.key === 'Enter' || evt.key === ' ') {
+        evt.preventDefault()
+        togglePrompt()
+      }
     })
-    // "Choose video to loop…" opens a native file dialog (main-process only,
-    // no direct fs access here); the picked path is persisted immediately by
-    // the IPC handler itself (mirrors exportVideoMode's own "settings are the
-    // source of truth, not the run payload" shape), so this side only needs
-    // to update the display.
+
+    // "Choose video…" opens a native file dialog (main-process only, no
+    // direct fs access here); the picked path is persisted immediately by the
+    // IPC handler itself, so this side only needs to update the display.
     this.els.chooseVideo.addEventListener('click', async () => {
       const filePath = await this.api.export.pickVideoFile()
       if (filePath) this.setLoopVideoPath(filePath)
@@ -397,13 +299,10 @@ export default class ExportPlugin {
       await this.api.settings.setExportLoopVideoPath(null)
       this.setLoopVideoPath(null)
       // Clearing the file with nothing else chosen falls back to black at
-      // render time regardless (see exportMix.js's renderVideoOutput), but
-      // left the background <select> itself still reading "Loop a video
-      // file" (and its subsection visible) until a reload re-read settings -
-      // make the visible choice match what will actually render right away.
-      this.els.videoBackground.value = 'black'
+      // render time regardless (see exportMix.js's renderVideoOutput) - make
+      // the visible choice match what will actually render right away.
+      this.setVideoBackground('black')
       await this.api.settings.setExportVideoBackground('black')
-      this.updateVideoBackgroundSubsectionVisibility()
     })
     this.els.chooseImage.addEventListener('click', async () => {
       const filePath = await this.api.export.pickImageFile()
@@ -412,9 +311,8 @@ export default class ExportPlugin {
     this.els.clearImage.addEventListener('click', async () => {
       await this.api.settings.setExportImagePath(null)
       this.setImagePath(null)
-      this.els.videoBackground.value = 'black'
+      this.setVideoBackground('black')
       await this.api.settings.setExportVideoBackground('black')
-      this.updateVideoBackgroundSubsectionVisibility()
     })
     this.els.imageMotion.addEventListener('change', () => {
       this.api.settings.setExportImageMotion(this.els.imageMotion.value)
@@ -438,38 +336,78 @@ export default class ExportPlugin {
     this.els.vizFps.addEventListener('change', () => {
       this.api.settings.setExportVisualizationOptions({ fps: Number(this.els.vizFps.value) })
     })
+
+    // The summary card's buttons are redrawn per state, so one listener on
+    // the card handles them all.
+    this.els.sum.addEventListener('click', (evt) => {
+      const btn = evt.target.closest('[data-act]')
+      if (!btn) return
+      const act = btn.dataset.act
+      if (act === 'run') this.runExport()
+      else if (act === 'copy-log') this.copyLogToClipboard(btn)
+      else if (act === 'toggle-log') {
+        this.logOpen = !this.logOpen
+        this.renderSummary()
+      } else if (act === 'again') {
+        this.view = 'form'
+        this.renderSummary()
+      }
+    })
+
     this.api.settings
       .get()
       .then((settings) => {
-        this.els.faster.checked = Boolean(settings.fasterExport)
-        this.els.parallelMixdown.checked = Boolean(settings.parallelMixdown)
-        this.els.videoMode.value = settings.exportVideoMode ?? 'audio-only'
-        this.els.infoFile.checked = Boolean(settings.exportInfoFile)
-        this.els.infoPromptRow.hidden = !this.els.infoFile.checked
+        this.setSwitch(this.els.faster, Boolean(settings.fasterExport))
+        this.lastFolder = settings.lastExportFolder ?? null
+        this.setSwitch(this.els.parallelMixdown, Boolean(settings.parallelMixdown))
+        this.setSwitch(this.els.infoFile, Boolean(settings.exportInfoFile))
+        this.els.infoPromptWrap.hidden = !settings.exportInfoFile
         this.els.infoPrompt.value = settings.exportInfoPrompt ?? ''
+        this.updateInfoPromptState()
         this.setLoopVideoPath(settings.exportLoopVideoPath ?? null)
         this.setImagePath(settings.exportImagePath ?? null)
         this.els.imageMotion.value = settings.exportImageMotion ?? 'none'
-        this.els.videoBackground.value = settings.exportVideoBackground ?? 'black'
         this.els.vizType.value = settings.exportVisualizationType ?? 'waveform'
         this.els.vizColor.value = settings.exportVisualizationColor ?? '#9ece6a'
         this.els.vizPalette.value = settings.exportVisualizationPalette ?? 'intensity'
         this.els.vizBgColor.value = settings.exportVisualizationBgColor ?? '#000000'
         this.els.vizSize.value = settings.exportVisualizationSize ?? 'medium'
         this.els.vizFps.value = String(settings.exportVisualizationFps ?? 15)
-        this.updateVideoBackgroundRowVisibility()
-        this.updateVideoBackgroundSubsectionVisibility()
+        this.setVideoMode(settings.exportVideoMode ?? 'audio-only')
+        this.setVideoBackground(settings.exportVideoBackground ?? 'black')
         this.updateVizFieldVisibility()
       })
       .catch((err) => console.error('Export: failed to read settings', err))
 
+    this.renderSummary()
     this.refresh().catch((err) => console.error('Export: failed to load presets/library', err))
+  }
+
+  bindSwitch(el, onChange) {
+    el.addEventListener('click', () => {
+      const on = el.getAttribute('aria-checked') !== 'true'
+      this.setSwitch(el, on)
+      onChange(on)
+    })
+  }
+
+  setSwitch(el, on) {
+    el.setAttribute('aria-checked', String(on))
+  }
+
+  isOn(el) {
+    return el.getAttribute('aria-checked') === 'true'
+  }
+
+  updateInfoPromptState() {
+    this.els.infoPromptState.textContent = this.els.infoPrompt.value.trim() ? 'Custom' : 'Default'
   }
 
   normalizeLengthField() {
     const seconds = parseDuration(this.els.length.value)
     this.els.length.value = seconds === null || seconds <= 0 ? DEFAULT_PREFS.length : formatDuration(seconds)
     this.savePrefs()
+    this.renderSummary()
   }
 
   // The export kind is picked first: "For phone" hides everything that only
@@ -478,17 +416,50 @@ export default class ExportPlugin {
   setKind(kind) {
     this.kind = kind
     const isPhone = kind === 'phone'
-    for (const option of this.els.kindOptions) option.setAttribute('aria-checked', String(option.dataset.kind === kind))
-    this.els.fileOptions.classList.toggle('hidden', isPhone)
-    this.els.fileHint.classList.toggle('hidden', isPhone)
-    this.els.phoneHint.classList.toggle('hidden', !isPhone)
+    for (const option of this.els.kindOptions) option.setAttribute('aria-pressed', String(option.dataset.kind === kind))
+    this.els.fileOptions.hidden = isPhone
+    this.els.phoneHint.hidden = !isPhone
+    this.els.optionsCard.hidden = isPhone
+    this.updateVideoCardVisibility()
+    this.renderSummary()
+  }
+
+  setFormat(format) {
+    this.format = format
+    for (const option of this.els.formatOptions) option.setAttribute('aria-pressed', String(option.dataset.format === format))
+    this.renderSummary()
+  }
+
+  // Video only drops the audio file, so the format tiles go with it (the
+  // mock hides them too); the video card shows for Video only and Both.
+  setVideoMode(mode) {
+    this.videoMode = mode
+    for (const option of this.els.outOptions) option.setAttribute('aria-pressed', String(option.dataset.out === mode))
+    this.els.formats.hidden = mode === 'video-only'
+    this.updateVideoCardVisibility()
+    this.renderSummary()
+  }
+
+  updateVideoCardVisibility() {
+    this.els.videoCard.hidden = this.kind === 'phone' || this.videoMode === 'audio-only'
+  }
+
+  // Only one of the three sub-sections (file picker / image picker /
+  // visualization controls) is relevant at a time, matching which of the
+  // four renderVideoOutput branches (exportMix.js) would actually run.
+  setVideoBackground(mode) {
+    this.videoBackground = mode
+    for (const option of this.els.vidOptions) option.setAttribute('aria-pressed', String(option.dataset.vid === mode))
+    this.els.videoFileSection.hidden = mode !== 'file'
+    this.els.imageSection.hidden = mode !== 'image'
+    this.els.vizSection.hidden = mode !== 'visualization'
   }
 
   savePrefs() {
     writePrefs(localStorage, {
       kind: this.kind,
       length: this.els.length.value,
-      format: this.els.format.value,
+      format: this.format,
       fadeIn: Number(this.els.fadeIn.value),
       fadeOut: Number(this.els.fadeOut.value)
     })
@@ -499,36 +470,14 @@ export default class ExportPlugin {
   // separators, which is all this display needs.
   setLoopVideoPath(filePath) {
     this.loopVideoPath = filePath || null
-    this.els.videoPath.textContent = filePath
-      ? `Looping: ${filePath.split(/[\\/]/).pop()}`
-      : 'No video chosen — using the flat black screen.'
+    this.els.videoPath.textContent = filePath ? `Looping ${baseName(filePath)}` : 'Nothing chosen yet'
     this.els.clearVideo.disabled = !filePath
   }
 
   setImagePath(filePath) {
     this.imagePath = filePath || null
-    this.els.imagePath.textContent = filePath
-      ? `Looping: ${filePath.split(/[\\/]/).pop()}`
-      : 'No image chosen — using the flat black screen.'
+    this.els.imagePath.textContent = filePath ? `Looping ${baseName(filePath)}` : 'Nothing chosen yet'
     this.els.clearImage.disabled = !filePath
-  }
-
-  // The video-background choice only makes sense once a video track is
-  // actually being produced - hidden entirely under 'audio-only' rather than
-  // shown disabled, matching this app's other mode-gated-field convention
-  // (e.g. Remix's scatter/schedule sections).
-  updateVideoBackgroundRowVisibility() {
-    this.els.videoBackgroundRow.classList.toggle('hidden', this.els.videoMode.value === 'audio-only')
-  }
-
-  // Only one of the three sub-sections (file picker / image picker /
-  // visualization controls) is relevant at a time, matching which of the
-  // four renderVideoOutput branches (exportMix.js) would actually run.
-  updateVideoBackgroundSubsectionVisibility() {
-    const mode = this.els.videoBackground.value
-    this.els.videoFileSection.classList.toggle('hidden', mode !== 'file')
-    this.els.imageSection.classList.toggle('hidden', mode !== 'image')
-    this.els.vizSection.classList.toggle('hidden', mode !== 'visualization')
   }
 
   // Spectrum picks its color from a fixed palette (showspectrum's own
@@ -537,61 +486,151 @@ export default class ExportPlugin {
   // Waveform/Vectorscope.
   updateVizFieldVisibility() {
     const isSpectrum = this.els.vizType.value === 'spectrum'
-    this.els.vizColorRow.classList.toggle('hidden', isSpectrum)
-    this.els.vizPaletteRow.classList.toggle('hidden', !isSpectrum)
+    this.els.vizColorRow.hidden = isSpectrum
+    this.els.vizPaletteRow.hidden = !isSpectrum
   }
 
-  toggleLogCollapsed() {
-    this.logCollapsed = !this.logCollapsed
-    this.els.log.classList.toggle('hidden', this.logCollapsed)
-    this.els.logToggle.textContent = this.logCollapsed ? '▸ Log' : '▾ Log'
-    this.els.logToggle.setAttribute('aria-expanded', String(!this.logCollapsed))
+  selectedPreset() {
+    return this.presets.find((p) => p.id === this.els.preset?.value) ?? null
   }
 
-  async copyLogToClipboard() {
-    const text = Array.from(this.els.log.children)
-      .map((line) => line.textContent)
-      .join('\n')
+  availableSoundCount(preset) {
+    if (!preset) return 0
+    return preset.sounds.filter((ps) => this.library.find((e) => e.id === ps.soundId)?.status === 'ok').length
+  }
+
+  // ---- the summary card: before, during and after an export ----
+
+  renderSummary() {
+    const sum = this.els.sum
+    if (!sum) return
+    const msg = this.message ? `<p class="ex-msg ${this.message.kind ?? ''}">${esc(this.message.text)}</p>` : ''
+    if (this.view === 'run') {
+      sum.innerHTML = `
+        <div class="ex-big">${ring('<span class="ex-mid ex-num2" id="export-pct">0%</span>')}</div>
+        <h2 class="ex-sumt">${esc(this.runTitle)}</h2>
+        <p class="ex-hint" id="export-elapsed"></p>
+        <ol class="ex-steps" id="export-steps"></ol>
+        <div class="ex-actions">
+          <button class="ex-b ex-ghost" type="button" data-act="copy-log">${icon('copy')}Copy log</button>
+          <button class="ex-b ex-ghost" type="button" data-act="toggle-log" aria-expanded="${this.logOpen}">${this.logOpen ? 'Hide log' : 'Show log'}</button>
+        </div>
+        <pre class="ex-log" id="export-log" ${this.logOpen ? '' : 'hidden'}></pre>`
+      this.renderProgress()
+      this.renderSteps()
+      this.renderLog()
+      this.tickElapsed?.()
+      return
+    }
+    if (this.view === 'done' || this.view === 'fail') {
+      const r = this.result
+      const ok = this.view === 'done'
+      const dl = (r.rows ?? []).map(([t, d]) => `<dt>${t}</dt><dd title="${esc(d)}">${esc(d)}</dd>`).join('')
+      const notes = (r.notes ?? []).map((n) => `<li class="${n.kind ?? ''}">${esc(n.text)}</li>`).join('')
+      sum.innerHTML = `
+        <div class="ex-big ${ok ? 'done' : 'fail'}" style="--p:100">${ring(`<span class="ex-mid">${icon(ok ? 'check' : 'x', 40)}</span>`)}</div>
+        <h2 class="ex-sumt">${ok ? 'Export finished' : 'Export failed'}</h2>
+        ${dl ? `<dl>${dl}</dl>` : ''}
+        ${notes ? `<ul class="ex-notes">${notes}</ul>` : ''}
+        <div class="ex-actions">
+          <button class="ex-b ex-ghost" type="button" data-act="copy-log">${icon('copy')}Copy log</button>
+          <button class="ex-b ex-ghost" type="button" data-act="toggle-log" aria-expanded="${this.logOpen}">${this.logOpen ? 'Hide log' : 'Show log'}</button>
+        </div>
+        <pre class="ex-log" id="export-log" ${this.logOpen ? '' : 'hidden'}></pre>
+        <button class="ex-b ex-ghost ex-wide" type="button" data-act="again">Export another</button>`
+      this.renderLog()
+      return
+    }
+    const preset = this.selectedPreset()
+    const count = this.availableSoundCount(preset)
+    let dl
+    if (this.kind === 'phone') {
+      dl = `<dt>Sounds</dt><dd>${count}</dd><dt>File</dt><dd>Phone preset (.ncvpreset)</dd>`
+    } else {
+      const seconds = parseDuration(this.els.length.value)
+      const length = seconds && seconds > 0 ? formatDuration(seconds) : '--:--:--'
+      dl = `<dt>Sounds</dt><dd>${count}</dd><dt>Length</dt><dd>${length}</dd><dt>File</dt><dd>${esc(describeFile({ format: this.format, seconds, videoMode: this.videoMode }))}</dd>`
+    }
+    sum.innerHTML = `
+      <h2 class="ex-sumt">This export</h2>
+      <dl>${dl}</dl>
+      ${this.lastFolder ? `<p class="ex-dest" title="${esc(this.lastFolder)}">${icon('folder')}<span>${esc(baseName(this.lastFolder))}</span></p>` : ''}
+      ${msg}
+      <button class="ex-b ex-pri ex-wide ex-tall" type="button" data-act="run" id="export-run" ${preset ? '' : 'disabled'}>${icon('upload')}Export</button>`
+  }
+
+  renderProgress() {
+    const pct = Math.round((this.lastFraction ?? 0) * 100)
+    const big = this.els.sum?.querySelector('.ex-big')
+    if (big) big.style.setProperty('--p', String(pct))
+    const label = this.els.sum?.querySelector('#export-pct')
+    if (label) label.textContent = `${pct}%`
+  }
+
+  renderSteps() {
+    const list = this.els.sum?.querySelector('#export-steps')
+    if (!list) return
+    const last = this.steps.length - 1
+    list.innerHTML = this.steps
+      .map((s, i) => {
+        const now = i === last && s.took == null
+        const meta = now ? (this.etaText ?? '') : s.took != null ? formatDuration(s.took) : ''
+        return `<li class="${now ? 'now' : 'done'}">${icon(now ? 'circle' : 'check')}<span>${esc(s.label)}</span><small>${meta}</small></li>`
+      })
+      .join('')
+  }
+
+  renderLog() {
+    const pre = this.els.sum?.querySelector('#export-log')
+    if (!pre) return
+    pre.textContent = this.logLines.join('\n')
+    pre.scrollTop = pre.scrollHeight
+  }
+
+  async copyLogToClipboard(btn) {
+    const text = this.logLines.join('\n')
     if (!text) return
     try {
       await navigator.clipboard.writeText(text)
-      const original = this.els.logCopy.textContent
-      this.els.logCopy.textContent = 'Copied!'
+      const original = btn.innerHTML
+      btn.textContent = 'Copied!'
       setTimeout(() => {
-        this.els.logCopy.textContent = original
+        btn.innerHTML = original
       }, 1200)
     } catch (err) {
       console.error('Export: failed to copy log', err)
     }
   }
 
-  // Elapsed/ETA next to the Export button itself (inbox: "show elapsed time
-  // and, if cheap, an estimated time remaining next to the Export button, not
-  // just buried in the log") - the log already has per-step timing, but
-  // that's easy to miss on a long unattended export. ETA is a simple
-  // extrapolation from the same 0..1 progress fraction the bar already
-  // tracks (elapsed * remaining/done) - unreliable in the first moment or two
-  // of a run, so it's withheld until the fraction is far enough along to mean
-  // anything.
+  // Elapsed under the title and time left on the running step (inbox: "show
+  // elapsed time and, if cheap, an estimated time remaining ... not just
+  // buried in the log"). ETA is a simple extrapolation from the same 0..1
+  // progress fraction the ring tracks (elapsed * remaining/done) - unreliable
+  // in the first moment or two of a run, so it's withheld until the fraction
+  // is far enough along to mean anything.
   startElapsedTicker(renderStartedAt) {
     this.stopElapsedTicker()
     this.lastFraction = 0
-    const tick = () => {
+    this.etaText = ''
+    this.tickElapsed = () => {
       const elapsedSeconds = (Date.now() - renderStartedAt) / 1000
-      let text = `${formatDuration(elapsedSeconds)} elapsed`
+      this.etaText = ''
       if (this.lastFraction > 0.02 && this.lastFraction < 1) {
         const etaSeconds = (elapsedSeconds * (1 - this.lastFraction)) / this.lastFraction
-        text += ` · ~${formatDuration(etaSeconds)} left`
+        this.etaText = `${formatDuration(etaSeconds)} left`
       }
-      this.els.elapsed.textContent = text
+      const el = this.els.sum?.querySelector('#export-elapsed')
+      if (el) el.textContent = `${formatDuration(elapsedSeconds)} elapsed`
+      this.renderSteps()
     }
-    tick()
-    this.elapsedTimer = setInterval(tick, 1000)
+    this.tickElapsed()
+    this.elapsedTimer = setInterval(this.tickElapsed, 1000)
   }
 
   stopElapsedTicker() {
     if (this.elapsedTimer) clearInterval(this.elapsedTimer)
     this.elapsedTimer = null
+    this.tickElapsed = null
   }
 
   async refresh() {
@@ -599,107 +638,107 @@ export default class ExportPlugin {
     this.presets = presets
     this.library = library
     const previouslySelected = this.els.preset.value
-    this.els.preset.innerHTML = presets.map((p) => `<option value="${p.id}">${p.name}</option>`).join('')
+    this.els.preset.innerHTML = presets.map((p) => `<option value="${esc(p.id)}">${esc(p.name)}</option>`).join('')
     // Each visit to the tab starts on the preset loaded in the Mixer.
     this.els.preset.value = pickDefaultPresetId(presets, requestActivePresetId(), previouslySelected)
+    this.renderSummary()
   }
 
-  // No Export-tab UI of its own for these (see the mount() comment above) -
-  // instead inherits the exported preset's own Preset Remix `wholeMix`
-  // directly, applied last over the whole export. Direct owner answer
-  // (2026-09-02) to the "keep it on Preset Remix" v0.1.125 ambiguity: "Yeah
-  // it should [inherit them]. Should be the last thing applied tho."
+  // No Export-tab UI of its own for these - instead inherits the exported
+  // preset's own Preset Remix `wholeMix` directly, applied last over the
+  // whole export. Direct owner answer (2026-09-02): "Yeah it should
+  // [inherit them]. Should be the last thing applied tho."
   //
   // Forwards the whole normalized `wholeMix` object (spread), not a
   // hand-picked field list - BUG FIX (v0.1.171): the old list-of-four here
-  // silently dropped Echo, Reverb, and Fluctuation, so a preset's whole-mix
-  // Echo/Reverb (v0.1.160/161) and volume drift never actually reached a
-  // real export even though exportMix.js's own pipeline had been taught to
-  // bake all of them (the Node harnesses that "verified" those releases
-  // called exportMix directly with a hand-built object, bypassing this
-  // function). `wholeMix` is `null` on a preset with no Preset Remix
-  // settings, which collapses to the same all-neutral shape this always
-  // returned.
+  // silently dropped Echo, Reverb, and Fluctuation. `wholeMix` is `null` on a
+  // preset with no Preset Remix settings, which collapses to the same
+  // all-neutral shape this always returned.
   currentWholeMixFilters(preset) {
     const wholeMix = preset?.wholeMix
     if (!wholeMix) return { highpassHz: 0, lowpassHz: 20000, gainDb: 0, eq: [] }
     return { ...wholeMix }
   }
 
+  showMessage(text, kind = '') {
+    this.message = { text, kind }
+    this.renderSummary()
+  }
+
+  beginRun(title) {
+    this.exporting = true
+    this.message = null
+    this.view = 'run'
+    this.runTitle = title
+    this.steps = []
+    this.logLines = []
+    this.lastFraction = 0
+    const startedAt = Date.now()
+    this.lastStepAt = startedAt
+    this.renderSummary()
+    this.startElapsedTicker(startedAt)
+    return startedAt
+  }
+
+  endRun(ok, result) {
+    this.closeLastLogLineTiming()
+    this.stopElapsedTicker()
+    this.exporting = false
+    this.result = result
+    this.view = ok ? 'done' : 'fail'
+    this.api.settings.get().then((st) => { this.lastFolder = st.lastExportFolder ?? this.lastFolder }).catch(() => {})
+    this.renderSummary()
+    playCompletionChime(ok)
+  }
+
   // "For phone" (app 0.1.268+): the app bakes each sound's clip, filters and
   // reverb included, into a .ncvpreset the Noctívago phone app plays live.
   async runPhoneExport(preset) {
     if (!this.api.export.runPhone) {
-      this.els.status.textContent = 'Update Noctívago to export for phone.'
+      this.showMessage('Update Noctívago to export for phone.', 'err')
       return
     }
     const outputPath = await this.api.export.pickDestination({ defaultName: preset.name, fileName: `${preset.name} - phone`, format: 'ncvpreset' })
     if (!outputPath) return
 
-    this.exporting = true
-    this.els.run.disabled = true
-    this.els.status.className = 'export-status'
-    this.els.status.textContent = `Exporting "${preset.name}" for phone…`
-    this.els.log.innerHTML = ''
-    this.els.logWrap.classList.remove('hidden')
-    this.els.progressWrap.classList.remove('hidden')
-    this.els.progressBar.style.width = '0%'
-    this.els.progressPct.textContent = '0%'
-    const startedAt = Date.now()
-    this.lastStepAt = startedAt
-    this.startElapsedTicker(startedAt)
+    const startedAt = this.beginRun(`Exporting ${preset.name} for phone`)
     let result
     try {
       result = await this.api.export.runPhone({ presetId: preset.id, outputPath })
     } catch (err) {
       result = { ok: false, error: err.message }
     }
-    this.closeLastLogLineTiming()
-    const elapsed = formatDuration((Date.now() - startedAt) / 1000)
-    this.els.progressWrap.classList.add('hidden')
+    const took = formatDuration((Date.now() - startedAt) / 1000)
     if (result.ok) {
-      const mb = (result.totalBytes / (1024 * 1024)).toFixed(1)
-      const lines = [
-        `✓ Saved for phone to ${result.path} (${result.soundCount} sounds, ${mb} MB) — took ${elapsed}`,
-        'Send this file to your phone and open it with Noctívago.',
-        ...result.warnings.map((w) => `⚠ ${w}`)
-      ]
-      this.els.status.className = 'export-status export-status-success'
-      this.els.status.textContent = lines.join('\n')
+      this.endRun(true, {
+        rows: [['File', baseName(result.path)], ['Sounds', String(result.soundCount)], ['Size', formatBytes(result.totalBytes)], ['Took', took]],
+        notes: [{ text: `Saved to ${result.path}` }, { text: 'Send this file to your phone and open it with Noctívago.' }, ...(result.warnings ?? []).map((w) => ({ text: w, kind: 'warn' }))]
+      })
     } else {
-      this.els.status.className = 'export-status export-status-error'
-      this.els.status.textContent = `✗ Export failed after ${elapsed}: ${result.error}`
+      this.endRun(false, { rows: [['Took', took]], notes: [{ text: result.error, kind: 'err' }] })
     }
-    playCompletionChime(result.ok)
-    this.stopElapsedTicker()
-    this.els.elapsed.textContent = ''
-    this.exporting = false
-    this.els.run.disabled = false
   }
 
   async runExport() {
     if (this.exporting) return
-    const preset = this.presets.find((p) => p.id === this.els.preset.value)
+    const preset = this.selectedPreset()
     if (!preset) {
-      this.els.status.textContent = 'Choose a preset first.'
+      this.showMessage('Choose a preset first.', 'err')
       return
     }
     if (this.kind === 'phone') return this.runPhoneExport(preset)
     const durationSeconds = parseDuration(this.els.length.value)
     if (!durationSeconds || durationSeconds <= 0) {
-      this.els.status.textContent = 'Enter a valid length (hh:mm:ss).'
+      this.showMessage('Enter a valid length (hh:mm:ss).', 'err')
       return
     }
 
     // BUG FIX (reported directly, "fix ASAP"): a Sound Group's own EQ/
-    // filters (Remix's Group mode, or the Mixer's right-click "Add to
-    // group…") sound exactly right live but had zero effect on an export -
-    // exportMix.js never even knew groups existed, only a preset's own
-    // whole-mix `wholeMix` (v0.1.129 taught it to inherit that, which
-    // predates Sound Groups). Each exported sound now carries which group
-    // (if any) it belongs to, and the group's own filters, so exportMix.js
-    // can route that group's members through their own filter chain before
-    // the final mix - the same bus a live SoundGroupChain already applies.
+    // filters sound exactly right live but had zero effect on an export.
+    // Each exported sound now carries which group (if any) it belongs to,
+    // and the group's own filters, so exportMix.js can route that group's
+    // members through their own filter chain before the final mix - the
+    // same bus a live SoundGroupChain already applies.
     const groupIdBySoundId = new Map()
     const groupFluctuationById = new Map()
     for (const group of preset.groups ?? []) {
@@ -709,9 +748,7 @@ export default class ExportPlugin {
 
     const sounds = []
     // Parallel to `sounds` (same filter, same order) but scoped to just what
-    // the optional info.txt describes - kept separate rather than bolted
-    // onto the `sounds` payload itself, since that array is forwarded
-    // straight to exportMix.js and tags mean nothing to the render pipeline.
+    // the optional info.txt describes.
     const soundInfoList = []
     // What "How the scene is set up" describes: each sound's effective
     // settings in this preset, with its volume.
@@ -720,9 +757,7 @@ export default class ExportPlugin {
       const baseline = this.library.find((e) => e.id === presetSound.soundId)
       if (!baseline || baseline.status !== 'ok') continue
       // Per-preset sound overrides (planned 2026-09-12): export must reflect
-      // this preset's own effective view of the sound, not its raw baseline,
-      // or an overridden sound would silently export sounding like every
-      // other preset instead of the one actually being exported.
+      // this preset's own effective view of the sound, not its raw baseline.
       const entry = applySoundOverride(baseline, presetSound.overrides)
       const playMode = entry.playMode ?? 'loop'
       sounds.push({
@@ -736,9 +771,7 @@ export default class ExportPlugin {
         crossfadeSeconds: entry.crossfadeSeconds ?? null,
         volume: presetSound.volume ?? entry.volume ?? 0.7,
         groupId: groupIdBySoundId.get(entry.id) ?? null,
-        // Volume Fluctuation (v0.1.171) - baked for loop-mode sounds only
-        // (the UI hides it for scatter/scheduled). exportMix.js ignores it
-        // for anything that isn't an ungrouped/grouped loop sound.
+        // Volume Fluctuation (v0.1.171) - baked for loop-mode sounds only.
         fluctuation: entry.fluctuation ?? null,
         // v0.1.218: a group drift axis set to "each sound on its own" sets
         // this sound's per-play random range for that axis.
@@ -760,64 +793,39 @@ export default class ExportPlugin {
     }
 
     if (sounds.length === 0) {
-      this.els.status.textContent = 'Nothing to export - this preset has no available sounds.'
+      this.showMessage('Nothing to export - this preset has no available sounds.', 'err')
       return
     }
 
-    // Self-review finding: picking "Loop a video file"/"Loop an image" from
-    // the dropdown without ever clicking Choose… used to run anyway and
-    // silently fall back to a plain black screen (renderVideoOutput's own
-    // fallback, meant as a safety net for a stale/deleted path - not meant
-    // to be the normal way to hit it from the UI). Caught here, before the
-    // destination picker even opens, same as the other pre-flight checks
-    // above - matches this app's own standing "never let a real outcome
-    // differ from what the UI implied without saying so" pattern (e.g. the
-    // Remix Save status line, the video/info-file error lines below).
-    const needsVideo = this.els.videoMode.value !== 'audio-only'
-    if (needsVideo && this.els.videoBackground.value === 'file' && !this.loopVideoPath) {
-      this.els.status.textContent = 'Choose a video file to loop, or switch the video background to something else.'
+    // Picking "Loop a video file"/"Loop an image" without ever choosing one
+    // used to run anyway and silently fall back to a black screen. Caught
+    // here, before the destination picker even opens.
+    const needsVideo = this.videoMode !== 'audio-only'
+    if (needsVideo && this.videoBackground === 'file' && !this.loopVideoPath) {
+      this.showMessage('Choose a video file to loop, or pick another video option.', 'err')
       return
     }
-    if (needsVideo && this.els.videoBackground.value === 'image' && !this.imagePath) {
-      this.els.status.textContent = 'Choose an image to loop, or switch the video background to something else.'
+    if (needsVideo && this.videoBackground === 'image' && !this.imagePath) {
+      this.showMessage('Choose an image to loop, or pick another video option.', 'err')
       return
     }
 
-    const format = this.els.format.value
-    // Filename carries a bit more than the bare preset name (inbox request:
-    // "{preset name} {video kind (if it is just black screen or
-    // visualization or whatever)} {export set length (eg: 9h)}") - the
-    // folder itself (defaultName) stays just the preset name so re-exporting
-    // the same preset keeps landing in the same folder.
-    const fileName = [
-      preset.name,
-      needsVideo ? videoKindFileLabel(this.els.videoBackground.value, this.els.vizType.value) : null,
-      formatDurationCompact(durationSeconds)
-    ]
+    const format = this.format
+    // Filename: "{preset name} - {video kind} - {length}" (inbox request);
+    // the folder itself (defaultName) stays just the preset name so
+    // re-exporting the same preset keeps landing in the same folder.
+    const fileName = [preset.name, needsVideo ? videoKindFileLabel(this.videoBackground, this.els.vizType.value) : null, formatDurationCompact(durationSeconds)]
       .filter(Boolean)
       .join(' - ')
     const outputPath = await this.api.export.pickDestination({ defaultName: preset.name, fileName, format })
     if (!outputPath) return
 
-    this.exporting = true
-    this.els.run.disabled = true
-    this.els.status.className = 'export-status'
-    this.els.status.textContent = `Exporting "${preset.name}" (${sounds.length} sound${sounds.length === 1 ? '' : 's'}, ${formatDuration(durationSeconds)})…`
-    this.els.log.innerHTML = ''
-    this.els.logWrap.classList.remove('hidden')
-    this.els.progressWrap.classList.remove('hidden')
-    this.els.progressBar.style.width = '0%'
-    this.els.progressPct.textContent = '0%'
-    // How long the render itself actually took, wall-clock - reported
-    // directly ("let the user know how much time it took to fully render the
-    // exported audio file... make the UI feel more explicit about it having
-    // finished exporting"), since a multi-hour export gives no sense of its
-    // own pace otherwise.
-    const renderStartedAt = Date.now()
-    this.lastStepAt = renderStartedAt
-    this.startElapsedTicker(renderStartedAt)
+    // How long the render itself took, wall-clock - reported directly ("let
+    // the user know how much time it took to fully render").
+    const renderStartedAt = this.beginRun(`Exporting ${preset.name}`)
     const fadeInSeconds = Number(this.els.fadeIn.value) || 0
     const fadeOutSeconds = Number(this.els.fadeOut.value) || 0
+    let outcome
 
     try {
       const result = await this.api.export.run({
@@ -831,30 +839,17 @@ export default class ExportPlugin {
         outputPath
       })
       this.closeLastLogLineTiming()
-      const elapsed = formatDuration((Date.now() - renderStartedAt) / 1000)
-      // "Clear the progress bar when it finishes" - a static bar frozen at
-      // 100% forever looked ambiguous (still running? actually done?) next to
-      // a status line that already says so in words; hiding it here makes
-      // "finished" the obvious, unambiguous state rather than something you
-      // have to read the fine print to confirm.
-      this.els.progressWrap.classList.add('hidden')
+      const took = formatDuration((Date.now() - renderStartedAt) / 1000)
       if (result.ok) {
-        this.els.status.className = 'export-status export-status-success'
         // 'video-only' deletes the standalone audio file once the video
-        // exists (see exportMix.js), so outputPath no longer points at
-        // anything real in that case - lead with the video instead.
-        let msg = result.audioRemoved
-          ? `✓ Exported video to ${result.videoPath} — took ${elapsed}`
-          : `✓ Exported to ${outputPath} — took ${elapsed}`
-        if (result.videoPath && !result.audioRemoved) msg += `\n✓ Video: ${result.videoPath}`
-        // A failed video in 'video-only' mode leaves the audio file in place
-        // rather than deleting the only output that actually succeeded (see
-        // exportMix.js) - the message above already names that audio path,
-        // so this just explains why it's there instead of a video.
-        else if (result.videoError) msg += `\n✗ Video render failed: ${result.videoError}`
-        if (this.els.infoFile.checked) {
-          // Looks up missing Freesound license details (a hand-downloaded
-          // file only carries id/author/title in its name). A failed lookup
+        // exists (see exportMix.js), so lead with the video in that case.
+        const mainPath = result.audioRemoved ? result.videoPath : outputPath
+        const notes = [{ text: `Saved to ${mainPath}` }]
+        if (result.videoPath && !result.audioRemoved) notes.push({ text: `Video: ${result.videoPath}` })
+        // A failed video in 'video-only' mode leaves the audio file in place.
+        else if (result.videoError) notes.push({ text: `Video render failed: ${result.videoError}`, kind: 'err' })
+        if (this.isOn(this.els.infoFile)) {
+          // Looks up missing Freesound license details. A failed lookup
           // still writes the file, with whatever is already known.
           let credits = sceneSounds.map(({ entry }) => ({ name: entry.name, source: entry.source ?? null }))
           try {
@@ -868,10 +863,10 @@ export default class ExportPlugin {
             presetName: preset.name,
             durationSeconds,
             format,
-            videoMode: this.els.videoMode.value,
-            videoBackground: this.els.videoBackground.value,
-            loopVideoName: this.loopVideoPath ? this.loopVideoPath.split(/[\\/]/).pop() : null,
-            imageName: this.imagePath ? this.imagePath.split(/[\\/]/).pop() : null,
+            videoMode: this.videoMode,
+            videoBackground: this.videoBackground,
+            loopVideoName: this.loopVideoPath ? baseName(this.loopVideoPath) : null,
+            imageName: this.imagePath ? baseName(this.imagePath) : null,
             imageMotion: this.els.imageMotion.value,
             visualizationSummary: `${this.els.vizType.value} visualization (${this.els.vizSize.value}, ${this.els.vizFps.value}fps)`,
             soundInfoList,
@@ -882,48 +877,31 @@ export default class ExportPlugin {
             prompt: this.els.infoPrompt.value
           })
           const infoResult = await this.api.export.writeInfoFile({ outputPath, content: infoContent })
-          msg += infoResult.ok ? `\n✓ Info file: ${infoResult.infoPath}` : `\n✗ Info file failed: ${infoResult.error}`
+          notes.push(infoResult.ok ? { text: `Info file: ${infoResult.infoPath}` } : { text: `Info file failed: ${infoResult.error}`, kind: 'err' })
         }
-        this.els.status.textContent = msg
-        playCompletionChime(true)
+        const size = result.audioRemoved ? null : estimateBytes(format, durationSeconds)
+        const rows = [['File', baseName(mainPath)], ...(size ? [['Size', `About ${formatBytes(size)}`]] : []), ['Took', took]]
+        outcome = { ok: true, result: { rows, notes } }
       } else {
-        this.els.status.className = 'export-status export-status-error'
-        this.els.status.textContent = `✗ Export failed after ${elapsed}: ${result.error}`
-        playCompletionChime(false)
+        outcome = { ok: false, result: { rows: [['Took', took]], notes: [{ text: result.error, kind: 'err' }] } }
       }
     } catch (err) {
       console.error('Export failed', err)
       this.closeLastLogLineTiming()
-      const elapsed = formatDuration((Date.now() - renderStartedAt) / 1000)
-      this.els.progressWrap.classList.add('hidden')
-      this.els.status.className = 'export-status export-status-error'
-      this.els.status.textContent = `✗ Export failed after ${elapsed}: ${err.message}`
-      playCompletionChime(false)
+      const took = formatDuration((Date.now() - renderStartedAt) / 1000)
+      outcome = { ok: false, result: { rows: [['Took', took]], notes: [{ text: err.message, kind: 'err' }] } }
     } finally {
       // Reported directly after a real overnight export ("i dozed off and
-      // didn't get the log. Make the text on the log box be exported to the
-      // final folder and i'll test it later for you") - the on-screen log
-      // (with its real timestamps/per-phase timings) only exists in the DOM,
-      // so it's gone the moment the tab or app closes. Written unconditionally
-      // on both success and failure - exportMix() already created the
-      // destination subfolder as the very first thing it does, before any
-      // real render work, so it's always there to write into by this point.
-      // Silent/best-effort: this is bookkeeping alongside the real result,
-      // not something worth cluttering the status line above over.
-      if (this.els.log && this.els.log.children.length > 0) {
-        const logContent = Array.from(this.els.log.children)
-          .map((line) => line.textContent)
-          .join('\n')
+      // didn't get the log") - the log is written next to the export on both
+      // success and failure. Silent/best-effort bookkeeping.
+      if (this.logLines.length > 0) {
         try {
-          await this.api.export.writeLogFile({ outputPath, content: logContent })
+          await this.api.export.writeLogFile({ outputPath, content: this.logLines.join('\n') })
         } catch (err) {
           console.error('Export: failed to write log file', err)
         }
       }
-      this.stopElapsedTicker()
-      this.els.elapsed.textContent = ''
-      this.exporting = false
-      this.els.run.disabled = false
+      this.endRun(outcome?.ok ?? false, outcome?.result ?? { notes: [{ text: 'Export stopped.', kind: 'err' }] })
     }
   }
 }
