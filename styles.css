@@ -53,7 +53,8 @@ select.ex-field { padding-right: 8px; }
 .ex-b:disabled { opacity: .38; cursor: not-allowed; }
 .ex-b.ex-wide { width: 100%; } .ex-b.ex-tall { height: 44px; font-size: 14px; }
 
-.ex-sw { position: relative; width: 36px; height: 20px; padding: 0; border: 0; border-radius: 10px; background: var(--surface-hover); cursor: pointer; flex: none; }
+/* A 40x24 target drawing a 36x20 track (the transparent border is hit area). */
+.ex-sw { position: relative; width: 40px; height: 24px; padding: 0; border: 2px solid transparent; border-radius: 12px; background: var(--surface-hover); background-clip: padding-box; cursor: pointer; flex: none; }
 .ex-sw::after { content: ''; position: absolute; left: 2px; top: 2px; width: 16px; height: 16px; border-radius: 50%; background: var(--text-dim); transition: transform 120ms; }
 .ex-sw[aria-checked="true"] { background: var(--tint); }
 .ex-sw[aria-checked="true"]::after { transform: translateX(16px); background: var(--tint-ink); }
