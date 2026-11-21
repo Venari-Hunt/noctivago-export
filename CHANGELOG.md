@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.3.1 — Time estimate
+
+- **The summary card shows "Time: about N min" before you export.** It learns from your own finished exports of the same preset (median of the last three, scaled to the new length), so it appears from the second export of a preset on; it can't be guessed from the settings alone because the work depends on the sounds. Shown per audio or video output.
+
 ## 1.3.0 — The 2.0 look
 
 - **New layout.** The form sits beside a summary card that shows what you get (sounds, length, file type and about how big) before you press Export.
