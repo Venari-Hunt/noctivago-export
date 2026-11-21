@@ -5,6 +5,7 @@ import { applySoundOverride } from '../domain/soundOverride.js'
 import { videoKindFileLabel, DEFAULT_INFO_PROMPT, buildInfoFileText } from '../domain/infoFile.js'
 import { readPrefs, writePrefs, pickDefaultPresetId, DEFAULT_PREFS } from '../domain/exportPrefs.js'
 import { describeFile, estimateBytes, formatBytes } from '../domain/exportSummary.js'
+import { recordRun, estimateSeconds, formatEstimate } from '../domain/exportTiming.js'
 import { playCompletionChime } from './chime.js'
 import { requestActivePresetId } from './mixerStatus.js'
 import { icon } from './icons.js'
@@ -556,7 +557,9 @@ export default class ExportPlugin {
     } else {
       const seconds = parseDuration(this.els.length.value)
       const length = seconds && seconds > 0 ? formatDuration(seconds) : '--:--:--'
-      dl = `<dt>Sounds</dt><dd>${count}</dd><dt>Length</dt><dd>${length}</dd><dt>File</dt><dd>${esc(describeFile({ format: this.format, seconds, videoMode: this.videoMode }))}</dd>`
+      // Only once this preset has finished an export before (see exportTiming.js).
+      const eta = formatEstimate(estimateSeconds(localStorage, { presetId: preset?.id, videoMode: this.videoMode, outputSeconds: seconds }))
+      dl = `<dt>Sounds</dt><dd>${count}</dd><dt>Length</dt><dd>${length}</dd><dt>File</dt><dd>${esc(describeFile({ format: this.format, seconds, videoMode: this.videoMode }))}</dd>${eta ? `<dt>Time</dt><dd title="From your earlier exports of this preset">${esc(eta)}</dd>` : ''}`
     }
     sum.innerHTML = `
       <h2 class="ex-sumt">This export</h2>
@@ -849,6 +852,7 @@ export default class ExportPlugin {
       this.closeLastLogLineTiming()
       const took = formatDuration((Date.now() - renderStartedAt) / 1000)
       if (result.ok) {
+        recordRun(localStorage, { presetId: preset.id, videoMode: this.videoMode, outputSeconds: durationSeconds, tookSeconds: (Date.now() - renderStartedAt) / 1000 })
         // 'video-only' deletes the standalone audio file once the video
         // exists (see exportMix.js), so lead with the video in that case.
         const mainPath = result.audioRemoved ? result.videoPath : outputPath
