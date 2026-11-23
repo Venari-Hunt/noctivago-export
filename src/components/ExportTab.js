@@ -5,6 +5,7 @@ import { applySoundOverride } from '../domain/soundOverride.js'
 import { videoKindFileLabel, DEFAULT_INFO_PROMPT, buildInfoFileText } from '../domain/infoFile.js'
 import { readPrefs, writePrefs, pickDefaultPresetId, DEFAULT_PREFS } from '../domain/exportPrefs.js'
 import { describeFile, estimateBytes, formatBytes } from '../domain/exportSummary.js'
+import { recordRun, estimateSeconds, formatEstimate } from '../domain/exportTiming.js'
 import { playCompletionChime } from './chime.js'
 import { requestActivePresetId } from './mixerStatus.js'
 import { icon } from './icons.js'
@@ -348,6 +349,11 @@ export default class ExportPlugin {
       else if (act === 'toggle-log') {
         this.logOpen = !this.logOpen
         this.renderSummary()
+      } else if (act === 'cancel') {
+        btn.disabled = true
+        this.api.export.cancel()
+      } else if (act === 'reveal') {
+        this.api.export.reveal(this.lastExportPath)
       } else if (act === 'again') {
         this.view = 'form'
         this.renderSummary()
@@ -511,6 +517,7 @@ export default class ExportPlugin {
         <h2 class="ex-sumt">${esc(this.runTitle)}</h2>
         <p class="ex-hint" id="export-elapsed"></p>
         <ol class="ex-steps" id="export-steps"></ol>
+        ${this.kind !== 'phone' && this.api.export.cancel ? `<button class="ex-b ex-ghost ex-wide" type="button" data-act="cancel">${icon('x')}Cancel export</button>` : ''}
         <div class="ex-actions">
           <button class="ex-b ex-ghost" type="button" data-act="copy-log">${icon('copy')}Copy log</button>
           <button class="ex-b ex-ghost" type="button" data-act="toggle-log" aria-expanded="${this.logOpen}">${this.logOpen ? 'Hide log' : 'Show log'}</button>
@@ -529,7 +536,7 @@ export default class ExportPlugin {
       const notes = (r.notes ?? []).map((n) => `<li class="${n.kind ?? ''}">${esc(n.text)}</li>`).join('')
       sum.innerHTML = `
         <div class="ex-big ${ok ? 'done' : 'fail'}" style="--p:100">${ring(`<span class="ex-mid">${icon(ok ? 'check' : 'x', 40)}</span>`)}</div>
-        <h2 class="ex-sumt">${ok ? 'Export finished' : 'Export failed'}</h2>
+        <h2 class="ex-sumt">${ok ? 'Export finished' : r.cancelled ? 'Export cancelled' : 'Export failed'}</h2>
         ${dl ? `<dl>${dl}</dl>` : ''}
         ${notes ? `<ul class="ex-notes">${notes}</ul>` : ''}
         <div class="ex-actions">
@@ -537,6 +544,7 @@ export default class ExportPlugin {
           <button class="ex-b ex-ghost" type="button" data-act="toggle-log" aria-expanded="${this.logOpen}">${this.logOpen ? 'Hide log' : 'Show log'}</button>
         </div>
         <pre class="ex-log" id="export-log" ${this.logOpen ? '' : 'hidden'}></pre>
+        ${ok && this.lastExportPath && this.api.export.reveal ? `<button class="ex-b ex-ghost ex-wide" type="button" data-act="reveal">${icon('folder')}Open folder</button>` : ''}
         <button class="ex-b ex-ghost ex-wide" type="button" data-act="again">Export another</button>`
       this.renderLog()
       return
@@ -549,7 +557,9 @@ export default class ExportPlugin {
     } else {
       const seconds = parseDuration(this.els.length.value)
       const length = seconds && seconds > 0 ? formatDuration(seconds) : '--:--:--'
-      dl = `<dt>Sounds</dt><dd>${count}</dd><dt>Length</dt><dd>${length}</dd><dt>File</dt><dd>${esc(describeFile({ format: this.format, seconds, videoMode: this.videoMode }))}</dd>`
+      // Only once this preset has finished an export before (see exportTiming.js).
+      const eta = formatEstimate(estimateSeconds(localStorage, { presetId: preset?.id, videoMode: this.videoMode, outputSeconds: seconds }))
+      dl = `<dt>Sounds</dt><dd>${count}</dd><dt>Length</dt><dd>${length}</dd><dt>File</dt><dd>${esc(describeFile({ format: this.format, seconds, videoMode: this.videoMode }))}</dd>${eta ? `<dt>Time</dt><dd title="From your earlier exports of this preset">${esc(eta)}</dd>` : ''}`
     }
     sum.innerHTML = `
       <h2 class="ex-sumt">This export</h2>
@@ -726,6 +736,7 @@ export default class ExportPlugin {
       this.showMessage('Choose a preset first.', 'err')
       return
     }
+    this.lastExportPath = null
     if (this.kind === 'phone') return this.runPhoneExport(preset)
     const durationSeconds = parseDuration(this.els.length.value)
     if (!durationSeconds || durationSeconds <= 0) {
@@ -841,9 +852,11 @@ export default class ExportPlugin {
       this.closeLastLogLineTiming()
       const took = formatDuration((Date.now() - renderStartedAt) / 1000)
       if (result.ok) {
+        recordRun(localStorage, { presetId: preset.id, videoMode: this.videoMode, outputSeconds: durationSeconds, tookSeconds: (Date.now() - renderStartedAt) / 1000 })
         // 'video-only' deletes the standalone audio file once the video
         // exists (see exportMix.js), so lead with the video in that case.
         const mainPath = result.audioRemoved ? result.videoPath : outputPath
+        this.lastExportPath = mainPath
         const notes = [{ text: `Saved to ${mainPath}` }]
         if (result.videoPath && !result.audioRemoved) notes.push({ text: `Video: ${result.videoPath}` })
         // A failed video in 'video-only' mode leaves the audio file in place.
@@ -883,7 +896,7 @@ export default class ExportPlugin {
         const rows = [['File', baseName(mainPath)], ...(size ? [['Size', `About ${formatBytes(size)}`]] : []), ['Took', took]]
         outcome = { ok: true, result: { rows, notes } }
       } else {
-        outcome = { ok: false, result: { rows: [['Took', took]], notes: [{ text: result.error, kind: 'err' }] } }
+        outcome = { ok: false, result: { cancelled: Boolean(result.cancelled), rows: [['Took', took]], notes: [{ text: result.error, kind: 'err' }] } }
       }
     } catch (err) {
       console.error('Export failed', err)
