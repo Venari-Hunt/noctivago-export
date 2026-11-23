@@ -1,6 +1,6 @@
 # Changelog
 
-- **Changed:** the video style "Spectrum" is now "Spectrogram".
+- **Changed:** the video style "Spectrum" is now "Spectrogram", and its exported files are named "Spectrogram viz".
 
 ## 1.3.1 — Time estimate
 

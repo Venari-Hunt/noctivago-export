@@ -28,6 +28,6 @@ test('applySoundOverride only applies overridable keys', () => {
 
 test('videoKindFileLabel', () => {
   assert.equal(videoKindFileLabel('file'), 'Looped video')
-  assert.equal(videoKindFileLabel('visualization', 'spectrum'), 'Spectrum viz')
+  assert.equal(videoKindFileLabel('visualization', 'spectrum'), 'Spectrogram viz')
   assert.equal(videoKindFileLabel('none'), 'Black screen')
 })
