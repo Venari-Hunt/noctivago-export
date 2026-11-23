@@ -139,7 +139,7 @@ export default class ExportPlugin {
                 ${row('Motion', 'Fades in and out with the audio', select('export-image-motion', 'Motion', [['none', 'None (static)'], ['spin', 'Spin'], ['bounce', 'DVD bounce']]))}
               </div>
               <div id="export-viz-section" hidden>
-                ${row('Style', '', select('export-viz-type', 'Style', [['waveform', 'Waveform'], ['spectrum', 'Spectrum'], ['vectorscope', 'Vectorscope']]))}
+                ${row('Style', '', select('export-viz-type', 'Style', [['waveform', 'Waveform'], ['spectrum', 'Spectrogram'], ['vectorscope', 'Vectorscope']]))}
                 <div id="export-viz-palette-row" hidden>${row('Palette', '', select('export-viz-palette', 'Palette', [['intensity', 'Intensity'], ['rainbow', 'Rainbow'], ['fire', 'Fire'], ['magma', 'Magma'], ['cool', 'Cool'], ['moreland', 'Moreland']]))}</div>
                 <div id="export-viz-color-row">${row('Color', '', '<input id="export-viz-color" type="color" class="ex-colorpick" value="#9ece6a" aria-label="Color" />')}</div>
                 ${row('Background', 'Black renders fastest', '<input id="export-viz-bg-color" type="color" class="ex-colorpick" value="#000000" aria-label="Background" />')}

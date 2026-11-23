@@ -1,5 +1,7 @@
 # Changelog
 
+
+- **Changed:** the video style "Spectrum" is now "Spectrogram".
 ## 1.3.0 — The 2.0 look
 
 - **New layout.** The form sits beside a summary card that shows what you get (sounds, length, file type and about how big) before you press Export.
