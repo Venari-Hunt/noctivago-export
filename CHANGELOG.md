@@ -1,5 +1,7 @@
 # Changelog
 
+- **Changed:** the video style "Spectrum" is now "Spectrogram".
+
 ## 1.3.1 — Time estimate
 
 - **The summary card shows "Time: about N min" before you export.** It learns from your own finished exports of the same preset (median of the last three, scaled to the new length), so it appears from the second export of a preset on; it can't be guessed from the settings alone because the work depends on the sounds. Shown per audio or video output.
