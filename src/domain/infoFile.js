@@ -8,7 +8,9 @@ export function videoKindFileLabel(videoBackground, visualizationType) {
   if (videoBackground === 'file') return 'Looped video'
   if (videoBackground === 'image') return 'Looped image'
   if (videoBackground === 'visualization') {
-    const type = String(visualizationType ?? 'waveform')
+    const raw = String(visualizationType ?? 'waveform')
+    // The style is shown as "Spectrogram"; its stored value stays 'spectrum'.
+    const type = raw === 'spectrum' ? 'spectrogram' : raw
     return `${type.charAt(0).toUpperCase()}${type.slice(1)} viz`
   }
   return 'Black screen'
