@@ -575,6 +575,9 @@ export default class ExportPlugin {
     if (big) big.style.setProperty('--p', String(pct))
     const label = this.els.sum?.querySelector('#export-pct')
     if (label) label.textContent = `${pct}%`
+    // The tab button shows the percent while another tab is in front (micro-interactions mock,
+    // row "Export"). New in app 2.0, so older apps simply skip it.
+    if (this.exporting) this.app.tabs.setProgress?.('export', pct)
   }
 
   renderSteps() {
@@ -694,6 +697,7 @@ export default class ExportPlugin {
     this.closeLastLogLineTiming()
     this.stopElapsedTicker()
     this.exporting = false
+    this.app.tabs.setProgress?.('export', null)
     this.result = result
     this.view = ok ? 'done' : 'fail'
     this.api.settings.get().then((st) => { this.lastFolder = st.lastExportFolder ?? this.lastFolder }).catch(() => {})
